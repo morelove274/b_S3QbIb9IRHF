@@ -54,7 +54,8 @@ import {
   STUDY_MODULES,
   CAMBRIDGE_LIBRARY,
   DICTATION_DATA,
-  DICTATION_SENTENCES
+  DICTATION_SENTENCES,
+  DICTATION_WORDS
 } from './study/StudyData';
 
 import { useStudy } from '../contexts/StudyContext';
@@ -888,18 +889,23 @@ function DictationView({ onBack }: { onBack: () => void }) {
   const PROGRESS_KEY = 'ielts_dictation_progress_v2';
   const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
-  // Interleaved level flow: 10 words -> 10 sentences -> 10 words ... (total up to 1000 levels)
-  const WORD_COUNT = DICTATION_DATA.length;
-  const SENT_COUNT = DICTATION_SENTENCES.length;
+  // Set word count to 1000 to match sentence count
+  const WORD_COUNT = 1000;
+  const SENT_COUNT = 1000;
   const TOTAL_LEVELS = WORD_COUNT + SENT_COUNT;
 
   type LevelItem = {
     id: string;
-    data: typeof DICTATION_DATA[number];
+    data: typeof DICTATION_DATA[number] | typeof DICTATION_SENTENCES[number];
     type: 'word' | 'sentence';
     typeIndex: number; // 0-based index within the word or sentence array
     levelIndex: number; // 0-based index in combined flow
   };
+
+  // Practice mode state
+  const [practiceMode, setPracticeMode] = useState<'word' | 'sentence'>('sentence');
+  // Difficulty level state
+  const [difficulty, setDifficulty] = useState<'easy' | 'medium' | 'hard'>('easy');
 
   // Resolve a combined-flow level index to a concrete word/sentence item.
   const getLevelAtIndex = (L: number): LevelItem | null => {
@@ -908,22 +914,51 @@ function DictationView({ onBack }: { onBack: () => void }) {
     const isWord = block % 2 === 0;
     const typeIdx = Math.floor(block / 2) * 10 + (L % 10);
     if (isWord) {
-      const data = DICTATION_DATA[typeIdx % WORD_COUNT];
+      const data = DICTATION_DATA[typeIdx % DICTATION_DATA.length];
       return { id: data.id, data, type: 'word', typeIndex: typeIdx % WORD_COUNT, levelIndex: L };
     }
-    const data = DICTATION_SENTENCES[typeIdx % SENT_COUNT];
+    const data = DICTATION_SENTENCES[typeIdx % DICTATION_SENTENCES.length];
     return { id: data.id, data, type: 'sentence', typeIndex: typeIdx % SENT_COUNT, levelIndex: L };
+  };
+
+  // Get item by type and index
+  const getItemByTypeAndIndex = (type: 'word' | 'sentence', index: number): LevelItem | null => {
+    if (type === 'word') {
+      const wordData = DICTATION_WORDS[difficulty];
+      if (index < 0 || index >= wordData.length) return null;
+      const data = wordData[index % wordData.length];
+      return { 
+        id: data.id, 
+        data, 
+        type: 'word', 
+        typeIndex: index, 
+        levelIndex: Math.floor(index / 10) * 20 + (index % 10) 
+      };
+    } else {
+      const sentenceData = DICTATION_SENTENCES[difficulty];
+      if (index < 0 || index >= sentenceData.length) return null;
+      const data = sentenceData[index % sentenceData.length];
+      return { 
+        id: data.id, 
+        data, 
+        type: 'sentence', 
+        typeIndex: index, 
+        levelIndex: Math.floor(index / 10) * 20 + 10 + (index % 10) 
+      };
+    }
   };
 
   // Find combined-flow level index from an item id (e.g. 'd23', 's41').
   const findLevelIndexById = (id: string): number => {
     if (id.startsWith('d')) {
-      const idx = DICTATION_DATA.findIndex(d => d.id === id);
+      const wordData = DICTATION_WORDS[difficulty];
+      const idx = wordData.findIndex(d => d.id === id);
       if (idx < 0) return -1;
       return Math.floor(idx / 10) * 20 + (idx % 10);
     }
     if (id.startsWith('s')) {
-      const idx = DICTATION_SENTENCES.findIndex(d => d.id === id);
+      const sentenceData = DICTATION_SENTENCES[difficulty];
+      const idx = sentenceData.findIndex(d => d.id === id);
       if (idx < 0) return -1;
       return Math.floor(idx / 10) * 20 + 10 + (idx % 10);
     }
@@ -936,6 +971,20 @@ function DictationView({ onBack }: { onBack: () => void }) {
     activeWordIndex?: number;
     lastEntryAt?: number;
     wrongIds?: string[];
+    wordModeProgress?: {
+      [key: string]: {
+        currentIndex: number;
+        correctCount: number;
+        wrongCount: number;
+      };
+    };
+    sentenceModeProgress?: {
+      [key: string]: {
+        currentIndex: number;
+        correctCount: number;
+        wrongCount: number;
+      };
+    };
   };
   const savedProgress = useMemo<ProgressRecord>(() => {
     try {
@@ -950,6 +999,16 @@ function DictationView({ onBack }: { onBack: () => void }) {
     timeElapsed: number;
     wrongCharCount: number;
     savedAt: number;
+    wordModeHistory?: {
+      accuracy: number | null;
+      timeElapsed: number;
+      wrongCharCount: number;
+    };
+    sentenceModeHistory?: {
+      accuracy: number | null;
+      timeElapsed: number;
+      wrongCharCount: number;
+    };
   };
   const history = useMemo<HistoryRecord | null>(() => {
     try {
@@ -988,6 +1047,33 @@ function DictationView({ onBack }: { onBack: () => void }) {
     initialReviewQueue ? 0 : (savedProgress.activeWordIndex ?? 0)
   );
   const [wrongIds, setWrongIds] = useState<string[]>(savedProgress.wrongIds || []);
+  
+  // Mode-specific progress
+  const [wordModeProgress, setWordModeProgress] = useState({
+    currentIndex: savedProgress.wordModeProgress?.[difficulty]?.currentIndex || 0,
+    correctCount: savedProgress.wordModeProgress?.[difficulty]?.correctCount || 0,
+    wrongCount: savedProgress.wordModeProgress?.[difficulty]?.wrongCount || 0
+  });
+  const [sentenceModeProgress, setSentenceModeProgress] = useState({
+    currentIndex: savedProgress.sentenceModeProgress?.[difficulty]?.currentIndex || 0,
+    correctCount: savedProgress.sentenceModeProgress?.[difficulty]?.correctCount || 0,
+    wrongCount: savedProgress.sentenceModeProgress?.[difficulty]?.wrongCount || 0
+  });
+
+  // Update progress when difficulty changes
+  useEffect(() => {
+    setWordModeProgress({
+      currentIndex: savedProgress.wordModeProgress?.[difficulty]?.currentIndex || 0,
+      correctCount: savedProgress.wordModeProgress?.[difficulty]?.correctCount || 0,
+      wrongCount: savedProgress.wordModeProgress?.[difficulty]?.wrongCount || 0
+    });
+    setSentenceModeProgress({
+      currentIndex: savedProgress.sentenceModeProgress?.[difficulty]?.currentIndex || 0,
+      correctCount: savedProgress.sentenceModeProgress?.[difficulty]?.correctCount || 0,
+      wrongCount: savedProgress.sentenceModeProgress?.[difficulty]?.wrongCount || 0
+    });
+    resetUIState();
+  }, [difficulty, savedProgress]);
 
   // Per-session UI state
   const [inputValue, setInputValue] = useState('');
@@ -1007,9 +1093,13 @@ function DictationView({ onBack }: { onBack: () => void }) {
   // Resolve the active level item (review queue or normal flow).
   const currentLevel: LevelItem | null = useMemo(() => {
     if (mode === 'review') return reviewQueue[reviewCursor] || null;
-    return getLevelAtIndex(currentLevelIndex);
+    if (practiceMode === 'word') {
+      return getItemByTypeAndIndex('word', wordModeProgress.currentIndex);
+    } else {
+      return getItemByTypeAndIndex('sentence', sentenceModeProgress.currentIndex);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, reviewQueue, reviewCursor, currentLevelIndex]);
+  }, [mode, reviewQueue, reviewCursor, practiceMode, wordModeProgress, sentenceModeProgress]);
 
   const currentSentence = currentLevel?.data;
   const inputRef = useRef<HTMLInputElement>(null);
@@ -1050,6 +1140,12 @@ function DictationView({ onBack }: { onBack: () => void }) {
     if (jumpTimerRef.current) {
       clearTimeout(jumpTimerRef.current);
       jumpTimerRef.current = null;
+    }
+
+    // In word mode, always move to next item
+    if (practiceMode === 'word') {
+      resetUIState();
+      return;
     }
 
     const wordsLen = currentSentence.words?.length || 0;
@@ -1153,13 +1249,21 @@ function DictationView({ onBack }: { onBack: () => void }) {
       activeWordIndex,
       lastEntryAt: Date.now(),
       wrongIds,
+      wordModeProgress: {
+        ...savedProgress.wordModeProgress,
+        [difficulty]: wordModeProgress
+      },
+      sentenceModeProgress: {
+        ...savedProgress.sentenceModeProgress,
+        [difficulty]: sentenceModeProgress
+      }
     };
     try {
       localStorage.setItem(PROGRESS_KEY, JSON.stringify(record));
     } catch (e) {
       console.log('[v0] failed saving dictation progress', e);
     }
-  }, [mode, currentLevelIndex, activeWordIndex, wrongIds]);
+  }, [mode, currentLevelIndex, activeWordIndex, wrongIds, wordModeProgress, sentenceModeProgress, difficulty, savedProgress]);
 
   // Keep a live ref of latest stats so unmount cleanup can snapshot them.
   const statsRef = useRef({
@@ -1211,7 +1315,12 @@ function DictationView({ onBack }: { onBack: () => void }) {
     if (!currentLevel || !currentSentence) return;
     if (!val.trim()) return;
 
-    const currentTarget = currentSentence.words?.[activeWordIndex]?.toLowerCase().replace(/[.,?!]/g, '') || '';
+    let currentTarget = '';
+    if (practiceMode === 'word') {
+      currentTarget = currentSentence.en?.toLowerCase().replace(/[.,?!]/g, '') || '';
+    } else {
+      currentTarget = currentSentence.words?.[activeWordIndex]?.toLowerCase().replace(/[.,?!]/g, '') || '';
+    }
     const inputClean = val.toLowerCase().trim();
 
     // Count this attempt
@@ -1227,9 +1336,24 @@ function DictationView({ onBack }: { onBack: () => void }) {
       setCorrectCount(prev => prev + 1);
       speak(currentTarget);
 
+      // Update mode-specific progress
+      if (practiceMode === 'word') {
+        setWordModeProgress(prev => ({
+          ...prev,
+          currentIndex: prev.currentIndex + 1,
+          correctCount: prev.correctCount + 1
+        }));
+      } else {
+        setSentenceModeProgress(prev => ({
+          ...prev,
+          currentIndex: prev.currentIndex + 1,
+          correctCount: prev.correctCount + 1
+        }));
+      }
+
       // In review mode: once the user gets the whole item right on its last word,
       // remove it from the wrong list.
-      const isLastWordOfItem = activeWordIndex >= (currentSentence.words?.length || 0) - 1;
+      const isLastWordOfItem = practiceMode === 'word' || activeWordIndex >= (currentSentence.words?.length || 0) - 1;
       if (isLastWordOfItem && currentLevel) {
         setWrongIds(prev => prev.filter(id => id !== currentLevel.id));
       }
@@ -1248,6 +1372,21 @@ function DictationView({ onBack }: { onBack: () => void }) {
 
       // Accumulate wrong character count for this session
       setWrongCharCount(prev => prev + countWrongChars(inputClean, currentTarget));
+
+      // Update mode-specific progress
+      if (practiceMode === 'word') {
+        setWordModeProgress(prev => ({
+          ...prev,
+          currentIndex: prev.currentIndex + 1,
+          wrongCount: prev.wrongCount + 1
+        }));
+      } else {
+        setSentenceModeProgress(prev => ({
+          ...prev,
+          currentIndex: prev.currentIndex + 1,
+          wrongCount: prev.wrongCount + 1
+        }));
+      }
 
       if (newErrCount >= 3) {
         // 3rd mistake: show persistent hint. Stay on the question.
@@ -1344,15 +1483,67 @@ function DictationView({ onBack }: { onBack: () => void }) {
               跳过复习
             </button>
           )}
+          <div className="flex gap-2 flex-wrap">
+            <button
+              onClick={() => setPracticeMode('word')}
+              className={`px-3 sm:px-4 py-1.5 sm:py-2 text-[10px] sm:text-[11px] font-black rounded-xl sm:rounded-2xl transition-all whitespace-nowrap ${
+                practiceMode === 'word'
+                  ? 'bg-primary text-on-primary shadow-md'
+                  : 'bg-surface-container-low text-on-surface-variant hover:bg-surface-container-high border border-outline-variant/10'
+              }`}
+            >
+              单词模式
+            </button>
+            <button
+              onClick={() => setPracticeMode('sentence')}
+              className={`px-3 sm:px-4 py-1.5 sm:py-2 text-[10px] sm:text-[11px] font-black rounded-xl sm:rounded-2xl transition-all whitespace-nowrap ${
+                practiceMode === 'sentence'
+                  ? 'bg-primary text-on-primary shadow-md'
+                  : 'bg-surface-container-low text-on-surface-variant hover:bg-surface-container-high border border-outline-variant/10'
+              }`}
+            >
+              句子模式
+            </button>
+            <button
+              onClick={() => setDifficulty('easy')}
+              className={`px-3 sm:px-4 py-1.5 sm:py-2 text-[10px] sm:text-[11px] font-black rounded-xl sm:rounded-2xl transition-all whitespace-nowrap ${
+                difficulty === 'easy'
+                  ? 'bg-green-500 text-white shadow-md'
+                  : 'bg-surface-container-low text-on-surface-variant hover:bg-surface-container-high border border-outline-variant/10'
+              }`}
+            >
+              简单
+            </button>
+            <button
+              onClick={() => setDifficulty('medium')}
+              className={`px-3 sm:px-4 py-1.5 sm:py-2 text-[10px] sm:text-[11px] font-black rounded-xl sm:rounded-2xl transition-all whitespace-nowrap ${
+                difficulty === 'medium'
+                  ? 'bg-yellow-500 text-white shadow-md'
+                  : 'bg-surface-container-low text-on-surface-variant hover:bg-surface-container-high border border-outline-variant/10'
+              }`}
+            >
+              中等
+            </button>
+            <button
+              onClick={() => setDifficulty('hard')}
+              className={`px-3 sm:px-4 py-1.5 sm:py-2 text-[10px] sm:text-[11px] font-black rounded-xl sm:rounded-2xl transition-all whitespace-nowrap ${
+                difficulty === 'hard'
+                  ? 'bg-red-500 text-white shadow-md'
+                  : 'bg-surface-container-low text-on-surface-variant hover:bg-surface-container-high border border-outline-variant/10'
+              }`}
+            >
+              困难
+            </button>
+          </div>
           <div className="px-3 sm:px-6 py-1.5 sm:py-2 bg-surface-container-low rounded-xl sm:rounded-2xl border border-outline-variant/10 flex-1 sm:flex-none text-center">
             <span className="text-[10px] sm:text-xs font-black text-on-surface-variant">
               {mode === 'review' ? (
                 <>复习 {reviewCursor + 1}/{reviewQueue.length} · {currentLevel.type === 'word' ? '单词' : '句子'}</>
+              ) : practiceMode === 'word' ? (
+                <>单词 {wordModeProgress.currentIndex + 1}/{WORD_COUNT}</>
               ) : (
-                <>关卡 {currentLevelIndex + 1}/{TOTAL_LEVELS} · {currentLevel.type === 'word' ? '单词' : '句子'} {currentLevel.typeIndex + 1}/{currentLevel.type === 'word' ? WORD_COUNT : SENT_COUNT}</>
+                <>句子 {sentenceModeProgress.currentIndex + 1}/{SENT_COUNT} · 第 {activeWordIndex + 1}/{currentSentence.words?.length} 词</>
               )}
-              {' · '}
-              <span className="text-on-surface-variant/60">第 {activeWordIndex + 1}/{currentSentence.words?.length} 词</span>
             </span>
           </div>
         </div>
@@ -1376,13 +1567,21 @@ function DictationView({ onBack }: { onBack: () => void }) {
 
         <div className="w-full max-w-lg space-y-2">
           <div className="relative group">
-            <input
+            <textarea
               ref={inputRef}
-              type="text"
               value={inputValue}
-              onChange={e => handleInputChange(e.target.value)}
+              onChange={e => {
+                handleInputChange(e.target.value);
+                // 自动调整高度
+                const textarea = e.target;
+                textarea.style.height = 'auto';
+                textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+              }}
               onKeyDown={e => {
-                if (e.key === 'Enter') handleCheck(inputValue);
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handleCheck(inputValue);
+                }
               }}
               placeholder="请输入听到的单词"
               disabled={isLocked}
@@ -1390,8 +1589,7 @@ function DictationView({ onBack }: { onBack: () => void }) {
               autoCorrect="off"
               autoCapitalize="off"
               spellCheck={false}
-              enterKeyHint="send"
-              className={`w-full pl-4 sm:pl-8 pr-20 sm:pr-24 py-4 sm:py-6 text-center text-xl sm:text-2xl md:text-3xl font-black bg-transparent border-b-4 sm:border-b-8 transition-all duration-300 outline-none ${
+              className={`w-full pl-4 sm:pl-8 pr-20 sm:pr-24 py-4 sm:py-6 text-center text-xl sm:text-2xl md:text-3xl font-black bg-transparent border-b-4 sm:border-b-8 transition-all duration-300 outline-none resize-none overflow-hidden min-h-[60px] max-h-[200px] ${
                 status === 'success'
                   ? 'border-green-500 text-green-600'
                   : status === 'error'
@@ -1447,8 +1645,11 @@ function DictationView({ onBack }: { onBack: () => void }) {
                   提示 Hint
                 </p>
                 <p className="text-xs sm:text-sm font-bold text-amber-800 mb-1">{currentSentence.zh}</p>
-                <p className="text-lg sm:text-2xl font-black tracking-wide text-amber-900">
-                  {currentSentence.words?.[activeWordIndex]?.replace(/[.,?!]/g, '') || ''}
+                <p className="text-lg sm:text-2xl font-black tracking-wide text-amber-900 mb-2">
+                  {currentSentence.en}
+                </p>
+                <p className="text-sm font-bold text-amber-700">
+                  单词: {currentSentence.words?.[activeWordIndex]?.replace(/[.,?!]/g, '') || ''}
                 </p>
                 <p className="mt-1 sm:mt-2 text-[10px] sm:text-xs font-bold text-amber-600">
                   请输入正确答案以继续

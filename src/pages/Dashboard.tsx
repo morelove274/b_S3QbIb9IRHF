@@ -1,419 +1,529 @@
-import React, { useState } from 'react';
-import { 
-  TrendingUp, 
-  BookOpen, 
-  Clock, 
-  CheckCircle2, 
-  ChevronRight, 
-  Calendar,
-  Target,
-  Zap,
-  ArrowUpRight,
-  Circle,
-  Search,
-  Mic,
-  ClipboardCheck,
-  History,
-  Trophy,
-  Download,
-  Flame,
-  Award,
-  ExternalLink,
+import React, { useState, useRef, useEffect } from 'react';
+import {
   Bot,
-  SpellCheck,
-  FileText
+  Send,
+  Mic,
+  LogIn,
+  Volume2,
+  VolumeX,
+  Pause,
+  Play
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  LineChart, 
-  Line, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
-  ResponsiveContainer,
-  AreaChart,
-  Area,
-  Radar,
-  RadarChart,
-  PolarGrid,
-  PolarAngleAxis,
-  PolarRadiusAxis
-} from 'recharts';
-import { useNavigate } from 'react-router-dom';
 import { useUser } from '../context/UserContext';
-import { useStudy } from '../contexts/StudyContext';
-import { VOCAB_DATA, CAMBRIDGE_LIBRARY, WRITING_SAMPLES, SPEAKING_TOPICS } from './study/StudyData';
 
 export default function Dashboard() {
-  const navigate = useNavigate();
-  const { profile } = useUser();
-  const { state, completeGoal, checkIn } = useStudy();
-  const [searchQuery, setSearchQuery] = useState('');
-  const [showSearchResults, setShowSearchResults] = useState(false);
+  const { profile, isLoggedIn } = useUser();
+  
+  // AI助手相关状态
+  const [messages, setMessages] = useState<Array<{ 
+    role: 'user' | 'assistant'; 
+    content: string;
+    isStreaming?: boolean;
+    audioPlaying?: boolean;
+  }>>([]);
+  const [inputText, setInputText] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [currentAudioId, setCurrentAudioId] = useState<string | null>(null);
+  const [recordingText, setRecordingText] = useState('');
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const synthRef = useRef<SpeechSynthesis | null>(null);
+  const aiModuleRef = useRef<HTMLDivElement>(null);
+  const streamingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const firstName = profile.name.split(' ')[0];
 
-  const activityData = [
-    { name: 'Mon', hours: 1.5, progress: 10 },
-    { name: 'Tue', hours: 2.3, progress: 15 },
-    { name: 'Wed', hours: 1.8, progress: 12 },
-    { name: 'Thu', hours: 3.0, progress: 20 },
-    { name: 'Fri', hours: 2.5, progress: 18 },
-    { name: 'Sat', hours: 4.2, progress: 30 },
-    { name: 'Sun', hours: 3.5, progress: 25 },
-  ];
+  // 滚动到最新消息
+  const scrollToBottom = () => {
+    if (messagesEndRef.current) {
+      // 使用直接滚动，避免平滑滚动
+      messagesEndRef.current.scrollIntoView({ behavior: 'auto' });
+    }
+  };
 
-  const radarData = (state.modules || []).map(m => ({
-    subject: m.id === 'listening' ? '听力' : 
-             m.id === 'reading' ? '阅读' : 
-             m.id === 'writing' ? '写作' : 
-             m.id === 'speaking' ? '口语' : 
-             m.id === 'vocab' ? '词汇' : '模考',
-    A: m.progress || 0,
-    fullMark: 100,
-  }));
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
-  const searchResults = searchQuery ? [
-    ...VOCAB_DATA.filter(v => v.word.toLowerCase().includes(searchQuery.toLowerCase())).map(v => ({ type: '词汇', title: v.word, desc: v.zh })),
-    ...CAMBRIDGE_LIBRARY.filter(c => c.title.toLowerCase().includes(searchQuery.toLowerCase())).map(c => ({ type: '真题', title: c.title, desc: '剑桥雅思真题集' })),
-    ...WRITING_SAMPLES.filter(s => s.title.toLowerCase().includes(searchQuery.toLowerCase())).map(s => ({ type: '范文', title: s.title, desc: `Band ${s.band}` })),
-    ...SPEAKING_TOPICS.filter(t => t.title.toLowerCase().includes(searchQuery.toLowerCase())).map(t => ({ type: '口语', title: t.title, desc: t.part })),
-  ].slice(0, 5) : [];
-
-  const handleExportReport = () => {
-    const report = {
-      user: profile.name,
-      studyDays: state.studyDays,
-      overallProgress: state.overallProgress,
-      masteredWords: state.masteredWords,
-      mockAverage: state.mockAverage,
-      date: new Date().toLocaleDateString()
+  // 清理超时
+  useEffect(() => {
+    return () => {
+      if (streamingTimeoutRef.current) {
+        clearTimeout(streamingTimeoutRef.current);
+      }
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+      if (synthRef.current) {
+        synthRef.current.cancel();
+      }
     };
-    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `IELTS_Study_Report_${profile.name}.json`;
-    link.click();
+  }, []);
+
+  // 语音合成功能 - 使用更自然的语音
+  const speakText = (text: string, messageId: number) => {
+    if (isMuted) return;
+    
+    if ('speechSynthesis' in window) {
+      const synth = window.speechSynthesis;
+      synthRef.current = synth;
+      
+      // 停止之前的语音
+      if (synth.speaking) {
+        synth.cancel();
+      }
+      
+      // 获取可用的语音列表，选择更自然的语音
+      const voices = synth.getVoices();
+      let selectedVoice = voices.find(voice => 
+        voice.lang.includes('zh-CN') && voice.name.includes('Microsoft')
+      ) || voices.find(voice => voice.lang.includes('zh-CN')) || voices[0];
+      
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'zh-CN';
+      utterance.rate = 0.9;
+      utterance.pitch = 1;
+      utterance.voice = selectedVoice;
+      
+      // 开始播放
+      setMessages(prev => prev.map((msg, idx) => 
+        idx === messageId ? { ...msg, audioPlaying: true } : msg
+      ));
+      setCurrentAudioId(`${messageId}`);
+      
+      utterance.onend = () => {
+        setMessages(prev => prev.map((msg, idx) => 
+          idx === messageId ? { ...msg, audioPlaying: false } : msg
+        ));
+        setCurrentAudioId(null);
+      };
+      
+      synth.speak(utterance);
+    }
+  };
+
+  // 暂停/继续语音
+  const toggleAudio = (messageId: number) => {
+    if ('speechSynthesis' in window) {
+      const synth = window.speechSynthesis;
+      
+      if (synth.speaking) {
+        synth.pause();
+        setMessages(prev => prev.map((msg, idx) => 
+          idx === messageId ? { ...msg, audioPlaying: false } : msg
+        ));
+      } else if (synth.paused) {
+        synth.resume();
+        setMessages(prev => prev.map((msg, idx) => 
+          idx === messageId ? { ...msg, audioPlaying: true } : msg
+        ));
+      }
+    }
+  };
+
+  // 发送消息到AI（模拟流式响应）
+  const sendMessage = async (e: React.MouseEvent | React.KeyboardEvent) => {
+    // 阻止默认行为
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+
+    if (!inputText.trim() || isLoading) return;
+
+    const userMessage = inputText.trim();
+    setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
+    setInputText('');
+    setIsLoading(true);
+
+    // 模拟流式响应
+    const messageId = messages.length + 1;
+    setMessages(prev => [...prev, { 
+      role: 'assistant', 
+      content: '', 
+      isStreaming: true 
+    }]);
+
+    try {
+      const response = await fetch('/api/ai', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          messages: [
+            ...messages.map(msg => ({
+              role: msg.role === 'user' ? 'user' : 'assistant',
+              content: msg.content
+            })),
+            { role: 'user', content: userMessage }
+          ]
+        })
+      });
+
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error.message || 'API调用失败');
+      }
+
+      const assistantMessage = data.choices[0].message.content;
+      
+      // 模拟流式输出
+      let currentContent = '';
+      const words = assistantMessage.split(' ');
+      
+      words.forEach((word, index) => {
+        if (streamingTimeoutRef.current) {
+          clearTimeout(streamingTimeoutRef.current);
+        }
+        
+        streamingTimeoutRef.current = setTimeout(() => {
+          currentContent += (index > 0 ? ' ' : '') + word;
+          setMessages(prev => prev.map((msg, idx) => 
+            idx === messageId ? { 
+              ...msg, 
+              content: currentContent,
+              isStreaming: index < words.length - 1
+            } : msg
+          ));
+          
+          if (index === words.length - 1) {
+            // 流式结束，开始语音播放
+            setTimeout(() => {
+              speakText(assistantMessage, messageId);
+            }, 500);
+          }
+        }, index * 100);
+      });
+      
+    } catch (error) {
+      console.error('发送消息失败:', error);
+      let errorMessage = '哎呀，暂时无法连接助手，请稍后再试~';
+      
+      // 根据错误类型给出不同的提示
+      if (error instanceof Error) {
+        if (error.message.includes('network')) {
+          errorMessage = '网络好像不太稳定，请检查一下网络后再试试';
+        } else if (error.message.includes('limit')) {
+          errorMessage = '今天的对话次数用完啦，明天再来和助手聊天吧';
+        }
+      }
+      
+      setMessages(prev => prev.map((msg, idx) => 
+        idx === messageId ? { 
+          ...msg, 
+          content: errorMessage,
+          isStreaming: false
+        } : msg
+      ));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // 语音识别功能 - 实时转文字
+  const startVoiceRecording = (e: React.MouseEvent) => {
+    // 阻止默认行为
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (!isLoggedIn) {
+      setShowLoginModal(true);
+      return;
+    }
+
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+      alert('您的浏览器不支持语音识别功能');
+      return;
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || (window as any).webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'zh-CN';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    recognition.onstart = () => {
+      setIsRecording(true);
+      setRecordingText('');
+    };
+
+    recognition.onresult = (event: any) => {
+      let transcript = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        transcript += event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          setInputText(transcript);
+          setRecordingText('');
+        } else {
+          setRecordingText(transcript);
+        }
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error('语音识别错误:', event.error);
+      setIsRecording(false);
+      setRecordingText('');
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+      if (recordingText) {
+        setInputText(recordingText);
+        setRecordingText('');
+      }
+    };
+
+    recognition.start();
+    recognitionRef.current = recognition;
+  };
+
+  const stopVoiceRecording = (e: React.MouseEvent) => {
+    // 阻止默认行为
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+    }
+  };
+
+  // 切换静音状态
+  const toggleMute = (e: React.MouseEvent) => {
+    // 阻止默认行为
+    e.preventDefault();
+    e.stopPropagation();
+
+    setIsMuted(!isMuted);
+    if (synthRef.current && synthRef.current.speaking) {
+      synthRef.current.cancel();
+      setCurrentAudioId(null);
+      setMessages(prev => prev.map(msg => ({
+        ...msg,
+        audioPlaying: false
+      })));
+    }
+  };
+
+  // 处理输入框点击（访客限制）
+  const handleInputClick = (e: React.MouseEvent) => {
+    // 阻止默认行为
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (!isLoggedIn) {
+      setShowLoginModal(true);
+    }
+  };
+
+  // 处理登录按钮点击
+  const handleLoginClick = (e: React.MouseEvent) => {
+    // 阻止默认行为
+    e.preventDefault();
+    e.stopPropagation();
+
+    setShowLoginModal(true);
+  };
+
+  // 处理登录弹窗按钮点击
+  const handleLoginModalClick = (e: React.MouseEvent) => {
+    // 阻止默认行为
+    e.preventDefault();
+    e.stopPropagation();
+
+    setShowLoginModal(false);
+    // 跳转到登录页面
+    window.location.href = '/login';
+  };
+
+  // 处理取消按钮点击
+  const handleCancelClick = (e: React.MouseEvent) => {
+    // 阻止默认行为
+    e.preventDefault();
+    e.stopPropagation();
+
+    setShowLoginModal(false);
   };
 
   return (
-    <div className="max-w-7xl mx-auto px-4 py-8 space-y-10">
-      {/* Search & Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
-        <motion.div
-          initial={{ opacity: 0, x: -20 }}
-          animate={{ opacity: 1, x: 0 }}
-        >
-          <h1 className="text-4xl font-black font-headline tracking-tight text-on-surface mb-2">
-            早安，{firstName}！
-          </h1>
-          <p className="text-on-surface-variant font-medium flex items-center gap-2">
-            <Calendar className="w-4 h-4" /> 今天是你的备考第 {state.studyDays} 天，保持专注。
-          </p>
-        </motion.div>
-
-        <div className="relative w-full md:w-96">
-          <div className="relative group">
-            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-on-surface-variant group-focus-within:text-primary transition-colors" />
-            <input 
-              type="text" 
-              placeholder="搜索真题/词汇/范文/口语素材..."
-              value={searchQuery}
-              onChange={(e) => {
-                setSearchQuery(e.target.value);
-                setShowSearchResults(true);
-              }}
-              onFocus={() => setShowSearchResults(true)}
-              className="w-full pl-12 pr-4 py-3 bg-surface-container-lowest border border-outline-variant/10 rounded-2xl focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all shadow-sm"
-            />
-          </div>
-
-          <AnimatePresence>
-            {showSearchResults && searchQuery && (
-              <>
-                <div className="fixed inset-0 z-10" onClick={() => setShowSearchResults(false)}></div>
-                <motion.div 
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 10 }}
-                  className="absolute top-full left-0 right-0 mt-2 bg-surface-container-lowest rounded-2xl shadow-2xl border border-outline-variant/10 z-20 overflow-hidden"
-                >
-                  {searchResults.length > 0 ? (
-                    <div className="divide-y divide-outline-variant/10">
-                      {searchResults.map((result, i) => (
-                        <button key={i} className="w-full px-6 py-4 text-left hover:bg-surface-container-low transition-colors flex items-center justify-between group">
-                          <div>
-                            <span className="text-[10px] font-black uppercase tracking-widest text-primary mb-1 block">{result.type}</span>
-                            <p className="font-bold text-on-surface">{result.title}</p>
-                            <p className="text-xs text-on-surface-variant">{result.desc}</p>
-                          </div>
-                          <ArrowUpRight className="w-4 h-4 text-slate-300 group-hover:text-primary transition-colors" />
-                        </button>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="p-8 text-center text-on-surface-variant text-sm italic">
-                      未找到相关资源
-                    </div>
-                  )}
-                </motion.div>
-              </>
-            )}
-          </AnimatePresence>
-        </div>
-      </div>
-
-      {/* Quick Access Area */}
-      <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {[
-          { icon: Bot, label: 'AI 口语教练', color: 'bg-blue-50 text-blue-600', link: '/study/speaking' },
-          { icon: ClipboardCheck, label: '真题模考', color: 'bg-purple-50 text-purple-600', link: '/study/mock' },
-          { icon: SpellCheck, label: '单词背诵', color: 'bg-amber-50 text-amber-600', link: '/study/vocab' },
-          { icon: FileText, label: '写作练笔', color: 'bg-green-50 text-green-600', link: '/study/writing' },
-        ].map((item, i) => (
-          <motion.button
-            key={i}
-            whileHover={{ y: -4 }}
-            onClick={() => navigate(item.link)}
-            className="bg-surface-container-lowest p-6 rounded-[2rem] border border-outline-variant/10 shadow-sm flex flex-col items-center gap-3 hover:shadow-md transition-all group"
-          >
-            <div className={`w-14 h-14 ${item.color} rounded-2xl flex items-center justify-center group-hover:scale-110 transition-transform`}>
-              <item.icon className="w-7 h-7" />
+    <div className="max-w-4xl mx-auto px-4 py-16" style={{ overflow: 'hidden' }}>
+      {/* AI助手模块 - 固定定位 */}
+      <motion.div
+        ref={aiModuleRef}
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.1 }}
+        className="bg-white rounded-[2.5rem] p-8 md:p-10 shadow-sm w-full"
+        style={{
+          height: '600px',
+          overflow: 'hidden'
+        }}
+      >
+        <div className="flex items-center justify-between mb-8">
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 bg-primary/10 rounded-2xl flex items-center justify-center">
+              <Bot className="w-6 h-6 text-primary" />
             </div>
-            <span className="font-black text-sm text-on-surface">{item.label}</span>
-          </motion.button>
-        ))}
-      </section>
+            <h2 className="text-2xl font-black font-headline">AI助手</h2>
+          </div>
+          {isLoggedIn && (
+            <button
+              onClick={toggleMute}
+              className={`w-10 h-10 rounded-full flex items-center justify-center ${isMuted ? 'bg-gray-100 text-gray-600' : 'bg-primary/10 text-primary'}`}
+            >
+              {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+            </button>
+          )}
+        </div>
 
-      <div className="grid grid-cols-12 gap-8">
-        {/* Left Column: Stats & Trends */}
-        <div className="col-span-12 lg:col-span-8 space-y-8">
-          {/* Main Progress Card */}
-          <div className="bg-surface-container-lowest rounded-[2.5rem] p-10 shadow-sm border border-outline-variant/10 relative overflow-hidden group">
-            <div className="absolute top-0 right-0 w-64 h-64 bg-primary/5 rounded-full -translate-y-1/2 translate-x-1/2 blur-3xl group-hover:bg-primary/10 transition-colors"></div>
-            
-            <div className="relative z-10">
-              <div className="flex justify-between items-start mb-10">
-                <div>
-                  <h2 className="text-2xl font-black font-headline mb-2">整体备考进度</h2>
-                  <p className="text-on-surface-variant text-sm font-bold">目标分数: 8.0 · 预计达成时间: 6月15日</p>
+        {!isLoggedIn ? (
+          <div className="text-center py-16">
+            <div className="w-20 h-20 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-6">
+              <Bot className="w-10 h-10 text-gray-400" />
+            </div>
+            <h3 className="text-xl font-bold mb-4">注册后解锁AI助手功能</h3>
+            <p className="text-gray-500 mb-8 max-w-md mx-auto">
+              AI助手可以回答你的所有问题，支持中英文对话，帮助你学习和备考。
+            </p>
+            <button
+              onClick={handleLoginClick}
+              className="px-8 py-4 bg-primary text-white rounded-2xl font-black shadow-lg hover:bg-primary/90 transition-all active:scale-95 flex items-center justify-center gap-2 mx-auto"
+            >
+              <LogIn className="w-5 h-5" /> 立即注册/登录
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col h-[calc(100%-120px)]">
+            {/* 对话历史区 - 内部滚动 */}
+            <div className="flex-1 overflow-y-auto mb-6 p-4 bg-gray-50 rounded-2xl space-y-4" style={{ scrollBehavior: 'auto' }}>
+              {messages.length === 0 ? (
+                <div className="text-center text-gray-400 py-8">
+                  <Bot className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                  <p>你好！我是你的AI助手，有什么可以帮你的吗？</p>
                 </div>
-                <button 
-                  onClick={handleExportReport}
-                  className="flex items-center gap-2 px-4 py-2 bg-surface-container-low hover:bg-surface-container-high text-on-surface text-xs font-bold rounded-full transition-colors"
+              ) : (
+                messages.map((message, index) => (
+                  <div
+                    key={index}
+                    className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'} relative`}
+                  >
+                    <div
+                      className={`max-w-[80%] p-4 rounded-2xl ${message.role === 'user' ? 'bg-primary text-white' : 'bg-white border border-gray-200'}`}
+                    >
+                      <p className="whitespace-pre-wrap">{message.content}</p>
+                      {message.role === 'assistant' && message.content && !message.isStreaming && (
+                        <button
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            toggleAudio(index);
+                          }}
+                          className="mt-2 text-xs flex items-center gap-1 text-gray-500 hover:text-gray-700"
+                        >
+                          {message.audioPlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+                          {message.audioPlaying ? '暂停' : '播放'}
+                        </button>
+                      )}
+                    </div>
+                    {message.isStreaming && (
+                      <div className="absolute -bottom-1 -right-1 bg-primary/20 text-primary text-xs px-2 py-1 rounded-full animate-pulse">
+                        正在输入中...
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* 输入区域 - 固定在底部 */}
+            <div className="flex gap-4">
+              <div className="flex-1 relative">
+                <input
+                  type="text"
+                  value={inputText}
+                  onChange={(e) => setInputText(e.target.value)}
+                  onKeyPress={(e) => e.key === 'Enter' && sendMessage(e)}
+                  onClick={handleInputClick}
+                  placeholder={isRecording ? '正在录音...' : '输入你的问题...'}
+                  className="w-full p-4 pl-12 pr-4 rounded-2xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+                  disabled={isLoading}
+                />
+                {isRecording && recordingText && (
+                  <div className="absolute left-12 top-1/2 -translate-y-1/2 text-gray-400 text-sm">
+                    {recordingText}
+                  </div>
+                )}
+                <button
+                  onClick={isRecording ? stopVoiceRecording : startVoiceRecording}
+                  className={`absolute left-4 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full flex items-center justify-center ${isRecording ? 'bg-red-100 text-red-600' : 'bg-gray-100 text-gray-600'}`}
                 >
-                  <Download className="w-4 h-4" /> 导出学习报告
+                  <Mic className="w-4 h-4" />
                 </button>
               </div>
-
-              <div className="flex items-end gap-6 mb-8">
-                <span className="text-7xl font-black font-headline tracking-tighter text-primary">{state.overallProgress}%</span>
-                <div className="pb-3">
-                  <span className="text-green-600 font-bold flex items-center gap-1 text-sm bg-green-50 px-3 py-1 rounded-full">
-                    <ArrowUpRight className="w-4 h-4" /> 本周 {state.overallProgress > 0 ? `+${Math.round(state.overallProgress / 2)}%` : '开始起航'}
-                  </span>
-                </div>
-              </div>
-
-              <div className="w-full bg-surface-container-high h-4 rounded-full mb-10 overflow-hidden">
-                <motion.div 
-                  initial={{ width: 0 }}
-                  animate={{ width: `${state.overallProgress}%` }}
-                  transition={{ duration: 1, ease: "easeOut" }}
-                  className="bg-primary h-full rounded-full shadow-[0_0_20px_rgba(var(--primary-rgb),0.3)]"
-                ></motion.div>
-              </div>
-
-              <div className="grid grid-cols-4 gap-4">
-                <div className="p-4 bg-surface-container-low rounded-2xl">
-                  <p className="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest mb-1">听力</p>
-                  <p className="text-xl font-black">{state.modules?.find(m => m.id === 'listening')?.progress ? (4 + (state.modules.find(m => m.id === 'listening')!.progress / 20)).toFixed(1) : '0.0'}</p>
-                </div>
-                <div className="p-4 bg-surface-container-low rounded-2xl">
-                  <p className="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest mb-1">阅读</p>
-                  <p className="text-xl font-black">{state.modules?.find(m => m.id === 'reading')?.progress ? (4 + (state.modules.find(m => m.id === 'reading')!.progress / 20)).toFixed(1) : '0.0'}</p>
-                </div>
-                <div className="p-4 bg-surface-container-low rounded-2xl">
-                  <p className="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest mb-1">写作</p>
-                  <p className="text-xl font-black">{state.modules?.find(m => m.id === 'writing')?.progress ? (4 + (state.modules.find(m => m.id === 'writing')!.progress / 20)).toFixed(1) : '0.0'}</p>
-                </div>
-                <div className="p-4 bg-surface-container-low rounded-2xl">
-                  <p className="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest mb-1">口语</p>
-                  <p className="text-xl font-black">{state.modules?.find(m => m.id === 'speaking')?.progress ? (4 + (state.modules.find(m => m.id === 'speaking')!.progress / 20)).toFixed(1) : '0.0'}</p>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Charts Section */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-            <div className="bg-surface-container-lowest p-8 rounded-[2.5rem] border border-outline-variant/10 shadow-sm">
-              <h3 className="text-lg font-black font-headline mb-6 flex items-center gap-2">
-                <TrendingUp className="w-5 h-5 text-primary" /> 近7天学习趋势
-              </h3>
-              <div className="h-64 w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={activityData}>
-                    <defs>
-                      <linearGradient id="colorHours" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="var(--primary)" stopOpacity={0.3}/>
-                        <stop offset="95%" stopColor="var(--primary)" stopOpacity={0}/>
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(0,0,0,0.05)" />
-                    <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 12, fontWeight: 600 }} />
-                    <YAxis hide />
-                    <Tooltip 
-                      contentStyle={{ borderRadius: '16px', border: 'none', boxShadow: '0 10px 30px rgba(0,0,0,0.1)' }}
-                      itemStyle={{ fontWeight: 800 }}
-                    />
-                    <Area type="monotone" dataKey="hours" stroke="var(--primary)" strokeWidth={3} fillOpacity={1} fill="url(#colorHours)" />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            <div className="bg-surface-container-lowest p-8 rounded-[2.5rem] border border-outline-variant/10 shadow-sm">
-              <h3 className="text-lg font-black font-headline mb-6 flex items-center gap-2">
-                <Target className="w-5 h-5 text-primary" /> 能力模型分布
-              </h3>
-              <div className="h-64 w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <RadarChart cx="50%" cy="50%" outerRadius="80%" data={radarData}>
-                    <PolarGrid stroke="rgba(0,0,0,0.05)" />
-                    <PolarAngleAxis dataKey="subject" tick={{ fontSize: 12, fontWeight: 700 }} />
-                    <Radar name="进度" dataKey="A" stroke="var(--primary)" fill="var(--primary)" fillOpacity={0.5} />
-                  </RadarChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </div>
-
-          {/* Score Curve */}
-          <div className="bg-surface-container-lowest p-8 rounded-[2.5rem] border border-outline-variant/10 shadow-sm">
-            <h3 className="text-lg font-black font-headline mb-6 flex items-center gap-2">
-              <TrendingUp className="w-5 h-5 text-green-600" /> 历次模考提分曲线
-            </h3>
-            <div className="h-64 w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={state.mockScores || []}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(0,0,0,0.05)" />
-                  <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fontSize: 12, fontWeight: 600 }} />
-                  <YAxis domain={[0, 9]} axisLine={false} tickLine={false} tick={{ fontSize: 12, fontWeight: 600 }} />
-                  <Tooltip 
-                    contentStyle={{ borderRadius: '16px', border: 'none', boxShadow: '0 10px 30px rgba(0,0,0,0.1)' }}
-                    itemStyle={{ fontWeight: 800 }}
-                  />
-                  <Line type="monotone" dataKey="score" stroke="#16a34a" strokeWidth={4} dot={{ r: 6, fill: '#16a34a', strokeWidth: 2, stroke: '#fff' }} activeDot={{ r: 8 }} />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </div>
-
-        {/* Right Column: Side Cards */}
-        <div className="col-span-12 lg:col-span-4 space-y-8">
-          {/* Streak & Check-in */}
-          <div className="bg-gradient-to-br from-primary to-primary-container rounded-[2.5rem] p-8 text-white shadow-xl relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -translate-y-1/2 translate-x-1/2 blur-2xl"></div>
-            <div className="relative z-10">
-              <div className="flex justify-between items-center mb-6">
-                <div className="flex items-center gap-2">
-                  <Flame className="w-6 h-6 text-amber-400 fill-amber-400" />
-                  <span className="font-black text-xl">连续打卡 {state.streak} 天</span>
-                </div>
-                <Trophy className="w-6 h-6 text-amber-300" />
-              </div>
-              <p className="text-blue-100 text-sm mb-8 font-medium">自律即自由，目标就在眼前。保持专注，你将在这个月看到质的飞跃。</p>
-              <button 
-                onClick={checkIn}
-                className="w-full py-4 bg-white text-primary rounded-2xl font-black shadow-lg hover:bg-blue-50 transition-all active:scale-95 flex items-center justify-center gap-2"
+              <button
+                onClick={(e) => sendMessage(e)}
+                disabled={!inputText.trim() || isLoading}
+                className={`px-6 py-4 bg-primary text-white rounded-2xl font-black shadow-lg hover:bg-primary/90 transition-all active:scale-95 flex items-center gap-2 ${!inputText.trim() || isLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
               >
-                立即打卡签到
+                <Send className="w-5 h-5" />
+                发送
               </button>
             </div>
           </div>
+        )}
+      </motion.div>
 
-          {/* Quick Links: Wrong Questions & Vocab */}
-          <div className="grid grid-cols-2 gap-4">
-            <button className="bg-surface-container-lowest p-6 rounded-[2rem] border border-outline-variant/10 shadow-sm hover:shadow-md transition-all text-left group">
-              <div className="w-10 h-10 bg-red-50 text-red-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
-                <History className="w-5 h-5" />
-              </div>
-              <p className="text-xs font-bold text-on-surface-variant uppercase tracking-widest mb-1">错题本</p>
-              <p className="text-2xl font-black">{state.wrongQuestionsCount}</p>
-            </button>
-            <button className="bg-surface-container-lowest p-6 rounded-[2rem] border border-outline-variant/10 shadow-sm hover:shadow-md transition-all text-left group">
-              <div className="w-10 h-10 bg-amber-50 text-amber-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
-                <BookOpen className="w-5 h-5" />
-              </div>
-              <p className="text-xs font-bold text-on-surface-variant uppercase tracking-widest mb-1">生词本</p>
-              <p className="text-2xl font-black">{state.newVocabCount}</p>
-            </button>
-          </div>
-
-          {/* Badges System */}
-          <div className="bg-surface-container-lowest rounded-[2.5rem] p-8 shadow-sm border border-outline-variant/10">
-            <h3 className="text-xl font-black font-headline mb-6 flex items-center gap-2">
-              <Award className="w-6 h-6 text-primary" /> 学习成就
-            </h3>
-            <div className="grid grid-cols-2 gap-4">
-              {(state.badges || []).map((badge) => (
-                <div 
-                  key={badge.id}
-                  className={`p-4 rounded-2xl border flex flex-col items-center text-center gap-2 transition-all ${
-                    badge.unlocked 
-                    ? 'bg-surface-container-low border-primary/20' 
-                    : 'bg-surface-container-lowest border-outline-variant/10 opacity-40 grayscale'
-                  }`}
-                >
-                  <span className="text-3xl">{badge.icon}</span>
-                  <span className="text-[10px] font-black uppercase tracking-widest text-on-surface">{badge.name}</span>
+      {/* 登录引导弹窗 */}
+      <AnimatePresence>
+        {showLoginModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+            onClick={handleCancelClick}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-white rounded-3xl p-10 max-w-md w-full mx-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="text-center space-y-6">
+                <div className="w-16 h-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto">
+                  <LogIn className="w-8 h-8 text-primary" />
                 </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Daily Goals Side Card */}
-          <div className="bg-surface-container-lowest rounded-[2.5rem] p-8 shadow-sm border border-outline-variant/10">
-            <div className="flex justify-between items-center mb-8">
-              <h3 className="text-xl font-black font-headline flex items-center gap-2">
-                <Target className="w-6 h-6 text-primary" /> 今日任务
-              </h3>
-              <span className="text-xs font-bold text-primary bg-primary/10 px-3 py-1 rounded-full">
-                {(state.dailyGoals || []).filter(g => g.completed).length}/{(state.dailyGoals || []).length}
-              </span>
-            </div>
-
-            <div className="space-y-4">
-              {(state.dailyGoals || []).map((goal) => (
-                <button 
-                  key={goal.id}
-                  onClick={() => !goal.completed && completeGoal(goal.id)}
-                  disabled={goal.completed}
-                  className={`w-full p-5 rounded-2xl border transition-all text-left flex items-start gap-4 ${
-                    goal.completed 
-                    ? 'bg-green-50 border-green-100 opacity-60' 
-                    : 'bg-surface-container-low border-outline-variant/5 hover:border-primary/30 hover:shadow-md'
-                  }`}
-                >
-                  <div className={`mt-1 ${goal.completed ? 'text-green-600' : 'text-slate-300'}`}>
-                    {goal.completed ? <CheckCircle2 className="w-5 h-5" /> : <Circle className="w-5 h-5" />}
-                  </div>
-                  <div>
-                    <p className={`font-bold text-sm mb-1 ${goal.completed ? 'line-through text-green-800' : 'text-on-surface'}`}>
-                      {goal.title}
-                    </p>
-                    <p className="text-xs text-on-surface-variant">{goal.desc}</p>
-                  </div>
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
+                <h3 className="text-2xl font-black">解锁AI助手</h3>
+                <p className="text-gray-600">
+                  注册或登录后，即可使用AI助手进行对话、学习和备考。
+                </p>
+                <div className="flex gap-4">
+                  <button
+                    onClick={handleLoginModalClick}
+                    className="flex-1 py-3 bg-primary text-white rounded-2xl font-black hover:bg-primary/90 transition-all"
+                  >
+                    立即登录
+                  </button>
+                  <button
+                    onClick={handleCancelClick}
+                    className="flex-1 py-3 border border-gray-300 text-gray-700 rounded-2xl font-black hover:bg-gray-50 transition-all"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
